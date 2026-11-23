@@ -235,6 +235,15 @@ fn runs(from: usize, to: usize, ring: usize) -> impl Iterator<Item = (usize, usi
     }))
 }
 
+/// The KV row count a slot takes for a context that reaches `need`: what it holds now, then a quarter more at a
+/// time. Doubling would jump a 65k prompt to 131k rows (4.3 GB) when the next token needs one more row, and the copy
+/// holds both buffers at once.
+fn grown_cap(cap: usize, need: usize, max_ctx: usize) -> usize {
+    let mut c = cap;
+    while c < need { c = (c + c / 4 + 1024).min(max_ctx); }
+    c
+}
+
 impl Device {
     /// None when a token cannot run on the device: no GPU or more than one, a dense matrix that is not in VRAM, a
     /// shape the kernels do not take, a tensor trace, no room, or `STRATA_DS_DEVICE=0`.
@@ -292,8 +301,23 @@ impl Device {
             // Core loop layers run 3x per token (75% of FFN compute), so prioritize them first.
             let cpu_share = std::env::var("STRATA_DS_CPU_SHARE").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.0);
             let (mut n_full, mut slab_bytes) = (0usize, 0usize);
+            // The KV rows the slabs must leave room for: the whole `--ctx` unless STRATA_DS_KV_TOKENS says less (a
+            // shorter promise frees room for more expert slabs, at the price of giving them back when the context
+            // passes it). Capped by what the card has after the plain weights, so the reserve never leaves a slab
+            // with nowhere to go.
+            let kv_rows = std::env::var("STRATA_DS_KV_TOKENS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(m.max_ctx)
+                .min(m.max_ctx).max(full);
+            let n_att = (0..c.n_slot()).filter(|&il| !c.swa[layer_of(c, il)]).count();
+            let mut kv_reserved = 0usize;
             if cpu_share <= 0.0 && c.n_expert <= 512 && c.n_used <= 32 {
                 let (b_res, f_res) = (64 << 20, 384 << 20);
+                {
+                    let d = dev::get().unwrap().lock().unwrap();
+                    let row_words = d.parts[0].be.kv_words(kw);
+                    let free = d.parts[0].be.mem_info().map_or(0, |x| x.0);
+                    kv_reserved = (4 * n_att * kv_rows * row_words + sc_bytes(c, kv_rows)).min(free.saturating_sub(1024 << 20));
+                }
+                let f_res = f_res + kv_reserved;
                 let order = (c.loop_start..c.loop_end).chain(0..c.loop_start).chain(c.loop_end..c.n_layer);
                 let key = |s: &[u8]| Some((s.as_ptr() as usize, s.len()));
                 for ip in order {
@@ -333,10 +357,13 @@ impl Device {
                     });
                 }
             }
-            if std::env::var_os("STRATA_DS_PROF").is_some() {
-                eprintln!("inkling2: preloaded {n_full}/{} expert layers ({:.2} GB) as contiguous slabs", c.n_layer, slab_bytes as f64 / 1e9);
-            }
             let all_full = layers.iter().all(|l| l.full_exps.is_some());
+            // One line that says what the decode state is and how much of it is where: a context that does not fit
+            // silently drops layers to the per-layer path, and without this line that looks like every other load.
+            let kv: usize = slots.iter().map(|s| s.k.len() + s.v.len()).sum();
+            let path = if all_full { "one graph per token" } else { "per layer" };
+            eprintln!("inkling2: preloaded {n_full}/{} expert layers ({:.2} GB), KV {:.2} GB now, {:.2} GB reserved, path: {path}",
+                c.n_layer, slab_bytes as f64 / 1e9, kv as f64 / 1e9, kv_reserved as f64 / 1e9);
             Ok(Device { layers, loops, slots, out_query, out_norm, scr, sc_buf, pf: None, s, rank, all_full, graph_keys: [0; 2], synced: 0, ahead: false })
         })();
         made.inspect_err(|e| eprintln!("inkling2: no room in VRAM for the decode state ({e:#}); the tokens run as prompt chunks do")).ok()
@@ -392,6 +419,34 @@ impl Device {
     }
 
     /// Room for the rows of position `need_pos` in the slots that grow and `sc_buf`.
+    /// Free expert slabs until `bytes` more VRAM is free on GPU 0, giving up the layers that run once a token
+    /// before the core ones (three runs a token). A freed layer keeps its attention and takes the per-layer FFN
+    /// path, and the recorded decode graph is dropped: it names the slabs that just went away.
+    fn drop_slabs(&mut self, c: &Inkling2Config, d: &mut dev::Dev, bytes: usize) -> usize {
+        let mut freed = 0usize;
+        let core = c.loop_start..c.loop_end;
+        let mut order: Vec<usize> = (0..self.layers.len()).filter(|&ip| !core.contains(&ip)).collect();
+        order.extend(core.clone());
+        let mut dropped = 0usize;
+        for ip in order {
+            if freed >= bytes { break; }
+            let Some(fe) = self.layers[ip].full_exps.take() else { continue };
+            freed += fe.gu.len() + fe.dn.len() + fe._gi.len() + fe.bias.len()
+                + fe.gu_scale.as_ref().map_or(0, |b| b.len()) + fe.dn_scale.as_ref().map_or(0, |b| b.len());
+            dropped += 1;
+        }
+        if freed > 0 {
+            eprintln!("inkling2: {dropped} expert layers left the device for a longer context ({:.2} GB freed); they run the per-layer path now",
+                freed as f64 / 1e9);
+            let be = &*d.parts[0].be;
+            for k in self.graph_keys { if k != 0 { let _ = be.graph_drop(k); } }
+            self.graph_keys = [0; 2];
+            self.all_full = false;
+            self.pf = None;
+        }
+        freed
+    }
+
     pub(super) fn prepare(&mut self, m: &Inkling2Model, need_pos: usize) -> Result<()> {
         let (c, kw) = (&m.cfg, m.cfg.n_head_kv * m.cfg.head_dim);
         let need = need_pos + 1;
@@ -400,10 +455,14 @@ impl Device {
         let row_words = d.parts[0].be.kv_words(kw);
         let full_cap = self.slots.iter().enumerate().find(|&(il, _)| !c.swa[layer_of(c, il)]).map(|(_, s)| s.cap);
         if let Some(cap) = full_cap && need > cap {
-            let mut new_cap = cap;
-            while new_cap < need { new_cap = (new_cap * 2).min(m.max_ctx); }
+            let new_cap = grown_cap(cap, need, m.max_ctx);
             let n = (0..c.n_slot()).filter(|&il| !c.swa[layer_of(c, il)]).count();
-            room(&mut d, 4 * n * new_cap * row_words + sc_bytes(c, new_cap) + (128 << 20));
+            let bytes = 4 * n * new_cap * row_words + sc_bytes(c, new_cap) + (128 << 20);
+            room(&mut d, bytes);
+            // A context that grows past what STRATA_DS_KV_TOKENS reserved has to take the room from the expert
+            // slabs: a failed allocation would send the whole session to the host path, which is 10x slower.
+            let free = d.parts[0].be.mem_info().map_or(0, |x| x.0);
+            if free < bytes { self.drop_slabs(c, &mut d, bytes - free); }
         }
         let be = &*d.parts[0].be;
         let need_sc = sc_bytes(c, need);
@@ -413,8 +472,7 @@ impl Device {
         }
         for (il, s) in self.slots.iter_mut().enumerate() {
             if c.swa[layer_of(c, il)] || need <= s.cap { continue; }
-            let mut new_cap = s.cap;
-            while new_cap < need { new_cap = (new_cap * 2).min(m.max_ctx); }
+            let new_cap = grown_cap(s.cap, need, m.max_ctx);
             for b in [&mut s.k, &mut s.v] {
                 let new = be.alloc(2 * new_cap * row_words)?;
                 be.dtod(b, 0, &new, 0, b.len())?;
